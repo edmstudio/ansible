@@ -211,9 +211,11 @@ class PluginLoader:
     def find_plugin(self, name, mod_type=''):
         ''' Find a plugin named name '''
 
-        cache = self._plugin_path_cache[mod_type]
+        # The particular cache to look for modules within.  This matches the
+        # requested mod_type
+        pull_cache = self._plugin_path_cache[mod_type]
         try:
-            return cache[name]
+            return pull_cache[name]
         except KeyError:
             # Cache miss.  Now let's find the plugin
             pass
@@ -235,32 +237,44 @@ class PluginLoader:
         # (add_directory()) once we start using the iterator.  Currently, it
         # looks like _get_paths() never forces a cache refresh so if we expect
         # additional directories to be added later, it is buggy.
-        for path in [p for p in self._get_paths() if p not in self._searched_paths]:
-            if os.path.isdir(path):
+        for path in (p for p in self._get_paths() if p not in self._searched_paths and os.path.isdir(p)):
+            try:
+                full_paths = (os.path.join(path, f) for f in os.listdir(path))
+            except OSError as e:
+                display.warning("Error accessing plugin paths: %s" % str(e))
+
+            for full_path in (f for f in full_paths if os.path.isfile(f) and not f.endswith('__init__.py')):
+                full_name = os.path.basename(full_path)
+
+                # HACK: We have no way of executing python byte
+                # compiled files as ansible modules so specifically exclude them
+                if full_path.endswith(('.pyc', '.pyo')):
+                    continue
+
+                splitname = os.path.splitext(full_name)
+                base_name = splitname[0]
                 try:
-                    full_paths = (os.path.join(path, f) for f in os.listdir(path))
-                except OSError as e:
-                    display.warning("Error accessing plugin paths: %s" % str(e))
+                    extension = splitname[1]
+                except IndexError:
+                    extension = ''
 
-                for full_path in (f for f in full_paths if os.path.isfile(f) and f.endswith(suffix) and not f.endswith('__init__.py')):
-                    full_name = os.path.basename(full_path)
+                # Module found, now enter it into the caches that match
+                # this file
+                if base_name not in self._plugin_path_cache['']:
+                    self._plugin_path_cache[''][base_name] = full_path
 
-                    # HACK: We have no way of executing python byte
-                    # compiled files as ansible modules so specifically exclude them
-                    if not self.class_name and full_path.endswith(('.pyc', '.pyo')):
-                        continue
-                    base_name = os.path.splitext(full_name)[0]
+                if full_name not in self._plugin_path_cache['']:
+                    self._plugin_path_cache[''][full_name] = full_path
 
-                    # Module found, now see if it's already in the cache
-                    if base_name not in cache:
-                        cache[base_name] = full_path
+                if base_name not in self._plugin_path_cache[extension]:
+                    self._plugin_path_cache[extension][base_name] = full_path
 
-                    if full_name not in cache:
-                        cache[full_name] = full_path
+                if full_name not in self._plugin_path_cache[extension]:
+                    self._plugin_path_cache[extension][full_name] = full_path
 
             self._searched_paths.add(path)
             try:
-                return cache[name]
+                return pull_cache[name]
             except KeyError:
                 # Didn't find the plugin in this directory.  Load modules from
                 # the next one
@@ -270,14 +284,14 @@ class PluginLoader:
         if not name.startswith('_'):
             alias_name = '_' + name
             # We've already cached all the paths at this point
-            if alias_name in cache:
-                if not os.path.islink(cache[alias_name]):
+            if alias_name in pull_cache:
+                if not os.path.islink(pull_cache[alias_name]):
                     display.deprecated('%s is kept for backwards compatibility '
                               'but usage is discouraged. The module '
                               'documentation details page may explain '
                               'more about this rationale.' %
                               name.lstrip('_'))
-                return cache[alias_name]
+                return pull_cache[alias_name]
 
         return None
 
