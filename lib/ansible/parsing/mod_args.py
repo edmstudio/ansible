@@ -233,9 +233,10 @@ class ModuleArgsParser:
         task, dealing with all sorts of levels of fuzziness.
         '''
 
-        thing       = None
+        thing      = None
+
         action      = None
-        connection  = self._task_ds.get('connection', None)
+        delegate_to = self._task_ds.get('delegate_to', None)
         args        = dict()
 
 
@@ -253,15 +254,15 @@ class ModuleArgsParser:
             action, args = self._normalize_parameters(thing, additional_args=additional_args)
 
         # local_action
-        local_action = False
         if 'local_action' in self._task_ds:
-            # local_action is similar but also implies a connection='local'
+            # local_action is similar but also implies a delegate_to
             if action is not None:
                 raise AnsibleParserError("action and local_action are mutually exclusive", obj=self._task_ds)
             thing = self._task_ds.get('local_action', '')
-            connection = 'local'
-            local_action = True
+            delegate_to = 'localhost'
             action, args = self._normalize_parameters(thing, additional_args=additional_args)
+
+        # module: <stuff> is the more new-style invocation
 
         # walk the input dictionary to see we recognize a module name
         for (item, value) in iteritems(self._task_ds):
@@ -275,7 +276,14 @@ class ModuleArgsParser:
 
         # if we didn't see any module in the task at all, it's not a task really
         if action is None:
-            raise AnsibleParserError("no action detected in task", obj=self._task_ds)
+            if 'ping' not in module_loader:
+                raise AnsibleParserError("The requested action was not found in configured module paths. "
+                        "Additionally, core modules are missing. If this is a checkout, "
+                        "run 'git submodule update --init --recursive' to correct this problem.",
+                        obj=self._task_ds)
+
+            else:
+                raise AnsibleParserError("no action detected in task", obj=self._task_ds)
         elif args.get('_raw_params', '') != '' and action not in RAW_PARAM_MODULES:
             templar = Templar(loader=None)
             raw_params = args.pop('_raw_params')
@@ -287,8 +295,4 @@ class ModuleArgsParser:
         # shell modules require special handling
         (action, args) = self._handle_shell_weirdness(action, args)
 
-        # now add the local action flag to the args, if it was set
-        if local_action:
-            args['_local_action'] = local_action
-
-        return (action, args, connection)
+        return (action, args, delegate_to)

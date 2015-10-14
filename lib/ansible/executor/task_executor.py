@@ -19,13 +19,12 @@
 from __future__ import (absolute_import, division, print_function)
 __metaclass__ = type
 
+import base64
 import json
-import pipes
 import subprocess
 import sys
 import time
 
-from jinja2.runtime import Undefined
 from six import iteritems
 
 from ansible import constants as C
@@ -33,11 +32,10 @@ from ansible.errors import AnsibleError, AnsibleParserError, AnsibleUndefinedVar
 from ansible.playbook.conditional import Conditional
 from ansible.playbook.task import Task
 from ansible.template import Templar
+from ansible.utils.encrypt import key_for_hostname
 from ansible.utils.listify import listify_lookup_plugin_terms
 from ansible.utils.unicode import to_unicode
 from ansible.vars.unsafe_proxy import UnsafeProxy
-
-from ansible.utils.debug import debug
 
 __all__ = ['TaskExecutor']
 
@@ -76,7 +74,7 @@ class TaskExecutor:
         task requires looping and either runs the task with 
         '''
 
-        debug("in run()")
+        self._display.debug("in run()")
 
         try:
             # lookup plugins need to know if this task is executing from
@@ -116,9 +114,9 @@ class TaskExecutor:
                 else:
                     res = dict(changed=False, skipped=True, skipped_reason='No items in the list', results=[])
             else:
-                debug("calling self._execute()")
+                self._display.debug("calling self._execute()")
                 res = self._execute()
-                debug("_execute() done")
+                self._display.debug("_execute() done")
 
             # make sure changed is set in the result, if it's not present
             if 'changed' not in res:
@@ -135,9 +133,9 @@ class TaskExecutor:
                     return res._obj
                 return res
 
-            debug("dumping result to json")
+            self._display.debug("dumping result to json")
             res = _clean_res(res)
-            debug("done dumping result, returning")
+            self._display.debug("done dumping result, returning")
             return res
         except AnsibleError as e:
             return dict(failed=True, msg=to_unicode(e, nonstring='simplerepr'))
@@ -147,7 +145,7 @@ class TaskExecutor:
             except AttributeError:
                 pass
             except Exception as e:
-                debug("error closing connection: %s" % to_unicode(e))
+                self._display.debug("error closing connection: %s" % to_unicode(e))
 
     def _get_loop_items(self):
         '''
@@ -261,21 +259,25 @@ class TaskExecutor:
 
         templar = Templar(loader=self._loader, shared_loader_obj=self._shared_loader_obj, variables=variables)
 
+        # apply the given task's information to the connection info,
+        # which may override some fields already set by the play or
+        # the options specified on the command line
+        self._play_context = self._play_context.set_task_and_variable_override(task=self._task, variables=variables, templar=templar)
+
         # fields set from the play/task may be based on variables, so we have to
         # do the same kind of post validation step on it here before we use it.
-        self._play_context.post_validate(templar=templar)
-
-        # now that the play context is finalized, we can add 'magic'
-        # variables to the variable dictionary
+        # We also add "magic" variables back into the variables dict to make sure
+        # a certain subset of variables exist.
         self._play_context.update_vars(variables)
+        self._play_context.post_validate(templar=templar)
 
         # Evaluate the conditional (if any) for this task, which we do before running
         # the final task post-validation. We do this before the post validation due to
         # the fact that the conditional may specify that the task be skipped due to a
         # variable not being present which would otherwise cause validation to fail
         if not self._task.evaluate_conditional(templar, variables):
-            debug("when evaulation failed, skipping this task")
-            return dict(changed=False, skipped=True, skip_reason='Conditional check failed')
+            self._display.debug("when evaulation failed, skipping this task")
+            return dict(changed=False, skipped=True, skip_reason='Conditional check failed', _ansible_no_log=self._play_context.no_log)
 
         # Now we do final validation on the task, which sets all fields to their final values.
         # In the case of debug tasks, we save any 'var' params and restore them after validating
@@ -305,7 +307,7 @@ class TaskExecutor:
             return dict(include=include_file, include_variables=include_variables)
 
         # get the connection and the handler for this execution
-        self._connection = self._get_connection(variables)
+        self._connection = self._get_connection(variables=variables, templar=templar)
         self._connection.set_host_overrides(host=self._host)
 
         self._handler = self._get_action_handler(connection=self._connection, templar=templar)
@@ -328,20 +330,20 @@ class TaskExecutor:
         # with the registered variable value later on when testing conditions
         vars_copy = variables.copy()
 
-        debug("starting attempt loop")
+        self._display.debug("starting attempt loop")
         result = None
         for attempt in range(retries):
             if attempt > 0:
-                # FIXME: this should use the callback/message passing mechanism
-                print("FAILED - RETRYING: %s (%d retries left). Result was: %s" % (self._task, retries-attempt, result))
+                # FIXME: this should use the self._display.callback/message passing mechanism
+                self._display.display("FAILED - RETRYING: %s (%d retries left). Result was: %s" % (self._task, retries-attempt, result), color="red")
                 result['attempts'] = attempt + 1
 
-            debug("running the handler")
+            self._display.debug("running the handler")
             try:
                 result = self._handler.run(task_vars=variables)
             except AnsibleConnectionFailure as e:
                 return dict(unreachable=True, msg=str(e))
-            debug("handler run complete")
+            self._display.debug("handler run complete")
 
             if self._task.async > 0:
                 # the async_wrapper module returns dumped JSON via its stdout
@@ -404,7 +406,7 @@ class TaskExecutor:
         # do the final update of the local variables here, for both registered
         # values and any facts which may have been created
         if self._task.register:
-            variables[self._task.register] = result 
+            variables[self._task.register] = result
 
         if 'ansible_facts' in result:
             variables.update(result['ansible_facts'])
@@ -415,8 +417,11 @@ class TaskExecutor:
         if self._task.notify is not None:
             result['_ansible_notify'] = self._task.notify
 
+        # preserve no_log setting
+        result["_ansible_no_log"] = self._play_context.no_log
+
         # and return
-        debug("attempt loop complete, returning result")
+        self._display.debug("attempt loop complete, returning result")
         return result
 
     def _poll_async_result(self, result, templar):
@@ -462,7 +467,7 @@ class TaskExecutor:
         else:
             return async_result
 
-    def _get_connection(self, variables):
+    def _get_connection(self, variables, templar):
         '''
         Reads the connection property for the host, and returns the
         correct connection object from the list of connection plugins
@@ -474,7 +479,18 @@ class TaskExecutor:
             self._play_context.remote_addr = self._host.address
 
         if self._task.delegate_to is not None:
-            self._compute_delegate(variables)
+            # since we're delegating, we don't want to use interpreter values
+            # which would have been set for the original target host
+            for i in variables.keys():
+                if i.startswith('ansible_') and i.endswith('_interpreter'):
+                    del variables[i]
+            # now replace the interpreter values with those that may have come
+            # from the delegated-to host
+            delegated_vars = variables.get('ansible_delegated_vars', dict()).get(self._host.name, dict())
+            if isinstance(delegated_vars, dict):
+                for i in delegated_vars:
+                    if i.startswith("ansible_") and i.endswith("_interpreter"):
+                        variables[i] = delegated_vars[i]
 
         conn_type = self._play_context.connection
         if conn_type == 'smart':
@@ -498,6 +514,38 @@ class TaskExecutor:
         if not connection:
             raise AnsibleError("the connection plugin '%s' was not found" % conn_type)
 
+        if self._play_context.accelerate:
+            # launch the accelerated daemon here
+            ssh_connection = connection
+            handler = self._shared_loader_obj.action_loader.get(
+                'normal',
+                task=self._task,
+                connection=ssh_connection,
+                play_context=self._play_context,
+                loader=self._loader,
+                templar=templar,
+                shared_loader_obj=self._shared_loader_obj,
+            )
+
+            key = key_for_hostname(self._play_context.remote_addr)
+            accelerate_args = dict(
+                password=base64.b64encode(key.__str__()),
+                port=self._play_context.accelerate_port,
+                minutes=C.ACCELERATE_DAEMON_TIMEOUT,
+                ipv6=self._play_context.accelerate_ipv6,
+                debug=self._play_context.verbosity,
+            )
+
+            connection = self._shared_loader_obj.connection_loader.get('accelerate', self._play_context, self._new_stdin)
+            if not connection:
+                raise AnsibleError("the connection plugin '%s' was not found" % conn_type)
+
+            try:
+                connection._connect()
+            except AnsibleConnectionFailure:
+                res = handler._execute_module(module_name='accelerate', module_args=accelerate_args, task_vars=variables, delete_remote_tmp=False)
+                connection._connect()
+
         return connection
 
     def _get_action_handler(self, connection, templar):
@@ -507,7 +555,7 @@ class TaskExecutor:
 
         if self._task.action in self._shared_loader_obj.action_loader:
             if self._task.async != 0:
-                raise AnsibleError("async mode is not supported with the %s module" % module_name)
+                raise AnsibleError("async mode is not supported with the %s module" % self._task.action)
             handler_name = self._task.action
         elif self._task.async == 0:
             handler_name = 'normal'
@@ -528,51 +576,4 @@ class TaskExecutor:
             raise AnsibleError("the handler '%s' was not found" % handler_name)
 
         return handler
-
-    def _compute_delegate(self, variables):
-
-        # get the vars for the delegate by its name
-        try:
-            self._display.debug("Delegating to %s" % self._task.delegate_to)
-            if self._task.delegate_to in C.LOCALHOST and self._task.delegate_to not in variables['hostvars']:
-                this_info = dict(ansible_connection="local")
-                for alt_local in C.LOCALHOST:
-                    if alt_local in variables['hostvars']:
-                        this_info = variables['hostvars'][self._task.delegate_to]
-                        if this_info == Undefined:
-                            this_info = dict(ansible_connection="local")
-                        break
-            else:
-                this_info = variables['hostvars'][self._task.delegate_to]
-
-            # get the real ssh_address for the delegate and allow ansible_ssh_host to be templated
-            self._play_context.remote_addr      = this_info.get('ansible_ssh_host', self._task.delegate_to)
-            self._play_context.remote_user      = this_info.get('ansible_remote_user', self._task.remote_user)
-            self._play_context.port             = this_info.get('ansible_ssh_port', self._play_context.port)
-            self._play_context.password         = this_info.get('ansible_ssh_pass', self._play_context.password)
-            self._play_context.private_key_file = this_info.get('ansible_ssh_private_key_file', self._play_context.private_key_file)
-            self._play_context.become_pass      = this_info.get('ansible_sudo_pass', self._play_context.become_pass)
-
-            conn = this_info.get('ansible_connection', self._task.connection)
-            if conn:
-                self._play_context.connection   = conn
-
-        except Exception as e:
-            # make sure the inject is empty for non-inventory hosts
-            this_info = {}
-            self._display.debug("Delegate to lookup failed due to: %s" % str(e))
-
-        # Last chance to get private_key_file from global variables.
-        # this is useful if delegated host is not defined in the inventory
-        if self._play_context.private_key_file is None:
-            self._play_context.private_key_file = this_info.get('ansible_ssh_private_key_file', None)
-
-        if self._play_context.private_key_file is None:
-            key = this_info.get('private_key_file', None)
-            if key:
-                self._play_context.private_key_file = os.path.expanduser(key)
-
-        for i in this_info:
-            if i.startswith("ansible_") and i.endswith("_interpreter"):
-                variables[i] = this_info[i]
 
